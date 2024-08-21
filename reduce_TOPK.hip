@@ -41,7 +41,7 @@ __device__ void ReduceTopK(float* smem1, float* smem2, int K)
     for (int i=0; i<K; i++)
     {
         float cur = smem2[i];
-        if (cur >= smem1[K-1])
+        if (cur > smem1[K-1])
         {
             smem1[K-1] = cur;
             for (int j=K-2; j>=0; j--)
@@ -52,7 +52,8 @@ __device__ void ReduceTopK(float* smem1, float* smem2, int K)
                     smem1[j] = smem1[j+1];
                     smem1[j+1]= temp;
                 }
-                else{
+                else
+                {
                     break;
                 }
             }
@@ -75,7 +76,7 @@ __device__  void TopKInThread(const float* in_data, float* smem, int K, int num_
         if (idx*num_ele_per_thread + i < row_length){
             float cur = *(in_data + idx*num_ele_per_thread + i);
             // find the first element which is greater than or equal to cur.
-            if (cur >= smem[K-1])
+            if (cur > smem[K-1])
             {
                 smem[K-1] = cur;
                 for (int j=K-2; j>=0; j--)
@@ -85,7 +86,9 @@ __device__  void TopKInThread(const float* in_data, float* smem, int K, int num_
                         float temp = smem[j];
                         smem[j] = smem[j+1];
                         smem[j+1]= temp;
-                    }else{
+                    }
+                    else
+                    {
                         break;
                     }
                 }
@@ -147,29 +150,39 @@ int main()
     size_t max_smem = prop.sharedMemPerBlock;
     debug_scalar("max_smem", max_smem);
 
-    // 根据K算出每个block能lanuch的最大线程数
+    // 根据K算出每个block能lanuch的,且能进行reduction最大线程数，需要同时满足3个条件
+    // 1. 每个block的shared memory能够为这些线程分配足够的资源
+    // 2. 线程的数量要是2的整数幂，这是为了能够正常的进行reduction操作
+    // 3. 不能超过每个block的ALU的数量，这样是为了避免切换线程上下文
     size_t temp_thread_per_block = max_smem / (K * sizeof(float));
-    size_t max_thread_per_block = MIN(1024, temp_thread_per_block); 
-    debug_scalar<size_t>("max_thread_per_block", max_thread_per_block);
+    size_t temp_thread_per_block_limit = std::pow(2, std::floor(std::log2(temp_thread_per_block)));
+    size_t thread_per_block_limit = MIN(1024, temp_thread_per_block_limit); 
+    debug_scalar<size_t>("thread_per_block_limit", thread_per_block_limit);
     
 
     // 如果按照最大的线程数来计算，根据元素总数算出每个线程应该处理多少数据， 这样算的好处是 每个线程处理尽量少的数据
-    size_t temp_element_per_thread = (row_length + max_thread_per_block -1) / max_thread_per_block;
+    size_t temp_element_per_thread = (row_length + thread_per_block_limit -1) / thread_per_block_limit;
     size_t element_per_thread = MAX(K, temp_element_per_thread);
 
-    // 按照每个元素应该处理的数据和元素的总数，再算出每个block的实际线程数
+    // 按照每个元素应该处理的数据和元素的总数，再算出每个block的实际线程数，还应满足如下条件
+    // 1. 为了正常进行reduction操作，线程数量应为2的整数次幂
+    // 2. 不能超过上文中计算出的 thread_per_block_limit    size_t tmp_acutal_thread_per_block = (row_length + element_per_thread -1) / element_per_thread;
     size_t tmp_acutal_thread_per_block = (row_length + element_per_thread -1) / element_per_thread;
-    size_t acutal_thread_per_block = std::pow(2, std::ceil(std::log2(tmp_acutal_thread_per_block)));
-    debug_scalar("acutal_thread_per_block", acutal_thread_per_block);
+    size_t tmp2_acutal_thread_per_block = std::pow(2, std::ceil(std::log2(tmp_acutal_thread_per_block)));
+    size_t actual_thread_per_block = MIN(tmp2_acutal_thread_per_block, thread_per_block_limit);
+    debug_scalar("acutal_thread_per_block", actual_thread_per_block);
+
+
+    // 为输出输出分配设备内存
     void* result_ptr, * in_ptr;
     hipMalloc(&result_ptr, K*sizeof(float));
     // hipMalloc(&result_ptr, acutal_thread_per_block*K*sizeof(float));
     hipMalloc(&in_ptr, row_length*sizeof(float));
     hipMemcpy(in_ptr, input_data.data(), row_length*sizeof(float), hipMemcpyHostToDevice);
 
-    LaunchTopKKernel<<<1, acutal_thread_per_block, K*acutal_thread_per_block*sizeof(float)>>>((float*)in_ptr, (float*)result_ptr, K, element_per_thread, row_length);
+    LaunchTopKKernel<<<1, actual_thread_per_block, K*actual_thread_per_block*sizeof(float)>>>((float*)in_ptr, (float*)result_ptr, K, element_per_thread, row_length);
 
-    std::vector<float> output_data(acutal_thread_per_block*K);
+    std::vector<float> output_data(K);
     hipMemcpy(output_data.data(), result_ptr, K*sizeof(float), hipMemcpyDeviceToHost);
     // hipMemcpy(output_data.data(), result_ptr, acutal_thread_per_block*K*sizeof(float), hipMemcpyDeviceToHost);
 
